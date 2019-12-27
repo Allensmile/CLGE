@@ -4,11 +4,12 @@ from tqdm import tqdm
 import os, json, codecs
 from collections import Counter
 from bert4keras.bert import build_bert_model
-from bert4keras.utils import Tokenizer, load_vocab
+from bert4keras.tokenizer import Tokenizer, load_vocab
 from keras.layers import *
 from keras.models import Model
 from keras import backend as K
 from keras.callbacks import Callback
+from bert4keras.snippets import parallel_apply
 from keras.optimizers import Adam
 from rouge import Rouge
 import keras
@@ -16,14 +17,21 @@ import math
 from sklearn.utils import shuffle
 import argparse
 
+def boolean_string(s):
+    if s not in {'False', 'True', 'false' ,'true'}:
+        raise ValueError('Not a valid boolean string')
+    return s == 'True' or s == 'true'
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--config_path', type=str, required=True,help='BERT配置文件路径')
 parser.add_argument('--checkpoint_path',type=str, required=True, help='BERT权重路径')
 parser.add_argument('--dict_path', type=str, required=True, help='词表路径')
-parser.add_argument('--albert', default=False, type=bool, required=False, help='是否使用Albert')
+parser.add_argument('--albert', default=False, type=boolean_string, required=False, help='是否使用Albert')
 
 parser.add_argument('--train_data_path',type=str, required=True, help='训练集路径')
 parser.add_argument('--val_data_path',type=str, required=True, help='验证集路径')
+parser.add_argument('--sample_path',type=str, required=False, help='语料样例路径')
+
 parser.add_argument('--epochs', default=5, type=int, required=False, help='训练循环')
 parser.add_argument('--batch_size', default=8, type=int, required=False, help='训练batch_size')
 parser.add_argument('--lr', default=1e-5, type=float, required=False, help='学习率')
@@ -39,7 +47,6 @@ def padding(x):
     """
     ml = max([len(i) for i in x])
     return np.array([i + [0] * (ml - len(i)) for i in x])
-
 
 
 class DataGenerator(keras.utils.Sequence):
@@ -89,8 +96,11 @@ class DataGenerator(keras.utils.Sequence):
         return padding(batch_x),padding(batch_y)
 
 
-
 def get_model(config_path,checkpoint_path,keep_words,albert=False,lr = 1e-5):
+    
+    if albert==True:
+        print("Using Albert!")
+        
     model = build_bert_model(
         config_path=config_path,
         checkpoint_path=checkpoint_path,
@@ -117,7 +127,8 @@ def gen_sent(s, topk=2):
     """beam search解码
     每次只保留topk个最优候选结果；如果topk=1，那么就是贪心搜索
     """
-    token_ids, segment_ids = tokenizer.encode(s[:max_input_len])
+    content_len = max_input_len - max_output_len
+    token_ids, segment_ids = tokenizer.encode(s[:content_len])
     target_ids = [[] for _ in range(topk)]  # 候选答案id
     target_scores = [0] * topk  # 候选答案分数
     for i in range(max_output_len):  # 强制要求输出不超过max_output_len字
@@ -145,6 +156,15 @@ def gen_sent(s, topk=2):
     # 如果max_output_len字都找不到结束符，直接返回
     return tokenizer.decode(target_ids[np.argmax(target_scores)])
 
+def just_show():
+    if sample_path == None:
+        return
+    with open(sample_path,'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            content = line.split('\t')[1].strip('\n')
+            print(u'生成标题:', gen_sent(content))        
+
 class Evaluate(keras.callbacks.Callback):
     def __init__(self, val_data_path, topk):
         self.data=pd.read_csv(val_data_path,sep = '\t',header=None,)
@@ -152,23 +172,23 @@ class Evaluate(keras.callbacks.Callback):
         self.topk = topk
 
     def on_epoch_end(self, epoch, logs=None):
-
-        for i in tqdm(range(len(self.data))):
-            rouge_l_scores = []
-            content = self.data.loc[i][1]
-            title = self.data.loc[i][0]
-            generated_title = gen_sent(content, self.topk)
-            token_title = " ".join([str(t) for t in tokenizer.encode(title)[0]])
+        just_show()
+        
+        rouge_scores = []
+        for a,b in self.data.iterrows():
+            generated_title = gen_sent(b[1], self.topk)
+            real_title = b[0]
+            token_title = " ".join([str(t) for t in tokenizer.encode(real_title)[0]])
             token_gen_title = " ".join([str(t) for t in tokenizer.encode(generated_title)[0]])
             rouge_score = rouge.get_scores(token_gen_title,token_title)
-            rouge_l_scores.append(rouge_score[0]['rouge-l']['f'])
-        print("rouge-l scores: ",np.mean(rouge_l_scores))
+            rouge_scores.append(rouge_score[0]['rouge-l']['f'])
+        print("rouge-l scores: ",np.mean(rouge_scores))
 
 
 config_path = args.config_path
 checkpoint_path = args.checkpoint_path
 dict_path = args.dict_path
-
+sample_path = args.sample_path
 
 min_count = 0
 max_input_len = args.max_input_len
@@ -180,39 +200,67 @@ topk = args.topk
 train_data_path = args.train_data_path
 val_data_path = args.val_data_path
 
-df_train = pd.read_csv(train_data_path,sep = '\t',header = None)
-df_val = pd.read_csv(val_data_path,sep = '\t',header = None)
+_token_dict = load_vocab(dict_path)  # 读取词典
+_tokenizer = Tokenizer(_token_dict, do_lower_case=True)  # 建立临时分词器
 
 
-chars = {}
-for df in [df_train,df_val]:
-    for a,b in tqdm(df.dropna().iterrows()):
-        for w in b[0]: # 纯文本，不用分词
-            chars[w] = chars.get(w,0) + 1
-            
-        for w in b[1]: # 纯文本，不用分词
-            chars[w] = chars.get(w,0) + 1
-                    
-                    
-chars = [(i, j) for i, j in chars.items() if j >= min_count]
-chars = sorted(chars, key=lambda c: - c[1])
-chars = [c[0] for c in chars]
+def read_texts():
+    txts = [train_data_path, val_data_path]
+    for txt in txts:
+        lines = open(txt).readlines()
+        for line in lines:
+            d = line.split('\t')
+            yield d[1][:max_input_len], d[0]
 
+def _batch_texts():
+    texts = []
+    for text in read_texts():
+        texts.extend(text)
+        if len(texts) >= 1000:
+            yield texts
+            texts = []
+    if texts:
+        yield texts
 
-_token_dict = load_vocab(dict_path) # 读取词典
-token_dict, keep_words = {}, []
+def _tokenize_and_count(texts):
+    _tokens = {}
+    for text in texts:
+        for token in _tokenizer.tokenize(text):
+            _tokens[token] = _tokens.get(token, 0) + 1
+    return _tokens
 
-for c in ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[unused1]']:
-    token_dict[c] = len(token_dict)
-    keep_words.append(_token_dict[c])
+tokens = {}
 
-for c in chars:
-    if c in _token_dict:
-        token_dict[c] = len(token_dict)
-        keep_words.append(_token_dict[c])
+def _total_count(result):
+    for k, v in result.items():
+        tokens[k] = tokens.get(k, 0) + v
 
+# 词频统计
+parallel_apply(
+    func=_tokenize_and_count,
+    iterable=tqdm(_batch_texts(), desc=u'构建词汇表中'),
+    workers=10,
+    max_queue_size=500,
+    callback=_total_count,
+)
 
-tokenizer = Tokenizer(token_dict) # 建立分词器
+tokens = [(i, j) for i, j in tokens.items() if j >= min_count]
+tokens = sorted(tokens, key=lambda t: -t[1])
+tokens = [t[0] for t in tokens]
+
+token_dict, keep_words = {}, []  # keep_words是在bert中保留的字表
+
+for t in ['[PAD]', '[UNK]', '[CLS]', '[SEP]']:
+    token_dict[t] = len(token_dict)
+    keep_words.append(_token_dict[t])
+
+for t in tokens:
+    if t in _token_dict and t not in token_dict:
+        token_dict[t] = len(token_dict)
+        keep_words.append(_token_dict[t])
+
+tokenizer = Tokenizer(token_dict, do_lower_case=True)  # 建立分词器
+
 
 rouge = Rouge()        
 model = get_model(config_path, checkpoint_path, keep_words, args.albert, args.lr)
@@ -222,7 +270,8 @@ evaluator = Evaluate(val_data_path, topk)
 model.fit_generator(
     DataGenerator(train_data_path,batch_size),
     epochs=epochs,
-    callbacks=[evaluator]
+    callbacks=[evaluator],
+    verbose = 1
 )
 
 
